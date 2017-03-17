@@ -1,0 +1,184 @@
+#!/usr/bin/env python3
+"""USAGE: nix-short-to-long PATH_IN_GIT_REPO ...
+
+Quick hack to convert use of short nix-env, nix-shell  etc. options to long
+ones. E.g. nix-env -e vim => nix-env --uninstall vim etc.
+
+The main motivation is to make documention more readable.
+"""
+
+import argparse
+import logging as log
+import os
+import re
+import subprocess
+import sys
+
+from pipes import quote as shell_quote
+
+NIX_COMMANDS = [
+    'nix-build',
+    'nix-copy-closure',
+    'nix-env',
+    'nix-install-package',
+    'nix-instantiate',
+    'nix-shell',
+    'nix-store',
+]
+
+
+LONG_TO_SHORT_REX = re.compile(
+    r'(?m)(^\s+|[{])(?P<long>--[^ ,/|]+)[ ,/|]+-(?P<short>\w)'
+)
+
+assert(LONG_TO_SHORT_REX.search('nix-env {--install | -i} [{--prebuilt-only | -b}] [{--attr | -A}] [--from-expression] [-E]'))
+assert LONG_TO_SHORT_REX.match('\n --out-link / -o outlink\n')
+assert LONG_TO_SHORT_REX.match(' --available / -a')
+
+NIX_COMMAND_INVOCATION_RE = '(%s) +[^ ]' % r'|'.join(NIX_COMMANDS)
+NIX_COMMAND_INVOCATION_REX = re.compile(NIX_COMMAND_INVOCATION_RE)
+
+
+def _parse_short_to_long_from_help(help_string):
+    return {
+        match.group('short'): match.group('long')
+        for match in LONG_TO_SHORT_REX.finditer(help_string)
+    }
+
+
+def _map_short_to_long_for_all_nix_commands():
+    nix_commands_short_to_long = {}
+    for cmd in NIX_COMMANDS:
+        help = subprocess.check_output([cmd, '--help']).decode('utf-8')
+        parsed = _parse_short_to_long_from_help(help)
+        assert parsed, 'Did not find any options for ' + cmd
+        nix_commands_short_to_long[cmd] = parsed
+    return nix_commands_short_to_long
+
+
+NIX_COMMANDS_SHORT_TO_LONG = _map_short_to_long_for_all_nix_commands()
+# nix-collect-garbage has an unparsable manpage; TODO(alexander): submit PR
+NIX_COMMANDS_SHORT_TO_LONG['nix-collect-garbage'] = {'d': 'delete-old'}
+
+
+def fixup_file(filename):
+    pass
+
+
+def parse_args():
+    parser = argparse.ArgumentParser(usage=__doc__)
+    arg = parser.add_argument
+    arg('-v', '--verbose', action='store_true')
+    arg('--extra-git-grep-args', nargs='*', default=[':(exclude)*.nix', ':(exclude).gitignore'])
+    arg('files', nargs='*', default=['.'])
+    args = parser.parse_args()
+    # ugly hack
+    first_file = args.files[0]
+    args.git_dir = subprocess.check_output(
+        ['git', 'rev-parse', '--show-toplevel'],
+        cwd=(
+            first_file if os.path.isdir(first_file)
+            else os.path.dirname(first_file)
+        )
+    ).strip().decode('utf-8')
+    return args
+
+
+def id(x):
+    return x
+
+
+def _search(regexp):
+    return re.compile(regexp).search
+
+
+def lt_escape(s):    return s.replace('<', '&lt;')
+def lt_unescape(s):  return s.replace('&lt;', '<')
+
+# just a heuristic hack
+SH_CMD_END = r' [|]{1,2} |; | && | [)]" |(?<!\\)(?:\\)*\n'
+# same as above, embedded in xml
+XML_SH_CMD_END = SH_CMD_END + '|<'
+EXT_TO_END_OF_STATEMENT_AND_TRANSFORM = [
+    (_search('\.(html|xml)$'), _search(XML_SH_CMD_END), lt_unescape, lt_escape),
+    (_search('.'),             _search(SH_CMD_END),     id,          id)
+]
+
+
+def long_to_short(invocation_string):
+    """
+    Examples:
+    >>> long_to_short("nix-env -e '*'")
+    "nix-env --uninstall '*'"
+    >>> long_to_short("nix-env -f ./user-envs.nix -qa --out-path --no-name '*'")
+    "nix-env --file ./user-envs.nix --query --available --out-path --no-name '*'"
+    >>> long_to_short("nix-store --print-env $(nix-instantiate '&lt;nixpkgs>' -A firefox)")
+    "nix-store --print-env $(nix-instantiate '&lt;nixpkgs>' --attr firefox)"
+    >>> long_to_short("nix-store --verify-path $(nix-store -qR $(which svn))")
+    "nix-store --verify-path $(nix-store --query --requisites $(which svn))"
+    """
+    nix_cmd = NIX_COMMAND_INVOCATION_REX.match(invocation_string).group(1)
+    nix_cmd_option_mapping = NIX_COMMANDS_SHORT_TO_LONG[nix_cmd]
+    known_shorts = ''.join(nix_cmd_option_mapping)
+    regex = r'(?<= )-([%(known_shorts)s]+)' % dict(known_shorts=known_shorts)
+    def repl(m):
+        ans = ' '.join(nix_cmd_option_mapping[c] for c in m.group(1))
+        if invocation_string[m.end():m.end()+1] not in (' ', '\t', ''):
+            ans += ' '
+        return ans
+    new = re.sub(regex, repl, invocation_string)
+    if new == invocation_string:
+        log.debug('Unchanged <<%s>>', invocation_string)
+    else:
+        log.debug('old: <<%s>>\n' 'new: <<%s>>', (invocation_string, new))
+    return new
+
+
+def convert_file(filename):
+    log.info('Doing %s' % filename)
+    ext = os.path.splitext(filename)[-1] or ''
+    for test, find_end, in_transform, out_transform in (
+            EXT_TO_END_OF_STATEMENT_AND_TRANSFORM):
+        if test(ext):
+            break
+    else:
+        assert False, 'BUG, should have matched file-extension:' + ext
+    last = 0
+    new_contents = []
+    with open(filename, 'r') as fh:
+        contents = fh.read()
+    for match in NIX_COMMAND_INVOCATION_REX.finditer(contents):
+        start = match.start()
+        end = find_end(contents, start).start()
+        new_contents.append(contents[last:start])
+        new = out_transform(long_to_short(in_transform(contents[start:end])))
+        assert '&gt' not in new
+        new_contents.append(new)
+        last = end
+    new_contents.append(contents[last:])
+    with open(filename, 'w') as fh:
+        fh.write(''.join(new_contents))
+
+
+
+if __name__ == '__main__':
+    args = parse_args()
+    log.basicConfig(
+        format='%(message)s',
+        level=log.DEBUG if args.verbose else log.INFO,
+    )
+    cmd = [
+        'git', '-C', args.git_dir, '--no-pager',
+        'grep', '-l', '-E', NIX_COMMAND_INVOCATION_RE,
+        '--',
+    ] + args.files + args.extra_git_grep_args
+    cmd_debug = ' '.join(map(shell_quote, cmd))
+    try:
+        matching_files = (
+            subprocess.check_output(cmd).decode('utf-8').strip().split('\n')
+        )
+    except subprocess.CalledProcessError as e:
+        log.exception("git command (%s) failed", cmd_debug)
+        sys.exit(1)
+    for filename in matching_files:
+        convert_file(filename)
