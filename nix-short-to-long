@@ -10,6 +10,7 @@ The main motivation is to make documention more readable.
 import argparse
 import logging as log
 import os
+import pprint
 import re
 import subprocess
 import sys
@@ -18,17 +19,54 @@ from pipes import quote as shell_quote
 
 NIX_COMMANDS = [
     "nix-build",
-    "nix-copy-closure",
     "nix-env",
-    "nix-install-package",
     "nix-instantiate",
     "nix-shell",
     "nix-store",
+    "nix build",
+    "nix develop",
+    "nix flake",
+    "nix help",
+    # nix help |grep  -Po '·.*\K(nix [a-z-]+)' | xargs -d $'\n' printf '"%s",\n'
+    "nix build",
+    "nix develop",
+    "nix flake init",
+    "nix flake new",
+    "nix help",
+    "nix profile",
+    "nix repl",
+    "nix run",
+    "nix search",
+    "nix shell",
+    "nix bundle",
+    "nix copy",
+    "nix edit",
+    "nix eval",
+    "nix fmt",
+    "nix log",
+    "nix path-info",
+    "nix registry",
+    "nix why-depends",
+    "nix daemon",
+    "nix describe-stores",
+    # "nix hash",
+    # "nix key",
+    "nix nar cat",
+    "nix nar dump-path",
+    "nix nar ls",
+    "nix print-dev-env",
+    "nix realisation",
+    "nix show-config",
+    "nix show-derivation",
+    "nix store verify",
+    "nix store ls",
+    # "nix doctor",
+    "nix upgrade-nix",
 ]
 
 
 LONG_TO_SHORT_REX = re.compile(
-    r"(?m)(^\s+|[{])(?P<long>--[^ ,/|]+)[ ,/|]+-(?P<short>\w)"
+    r"(?m)(^\s*[o·]?\s+|[{])(?P<long>--[^ ,;/|]+)[ ,;/|]+-(?P<short>\w)"
 )
 
 assert LONG_TO_SHORT_REX.search(
@@ -36,35 +74,51 @@ assert LONG_TO_SHORT_REX.search(
 )
 assert LONG_TO_SHORT_REX.match("\n --out-link / -o outlink\n")
 assert LONG_TO_SHORT_REX.match(" --available / -a")
+assert LONG_TO_SHORT_REX.match(" --available; -a")
 
 NIX_COMMAND_INVOCATION_RE = "(%s) +[^ ]" % r"|".join(NIX_COMMANDS)
 NIX_COMMAND_INVOCATION_REX = re.compile(NIX_COMMAND_INVOCATION_RE)
 
 
-def _parse_short_to_long_from_help(help_string):
-    return {
+def _parse_short_to_long_from_help(cmd, help_string):
+    ans = {
         match.group("short"): match.group("long")
         for match in LONG_TO_SHORT_REX.finditer(help_string)
     }
+    if not ans:
+        print("WARNING: Did not find any options for " + cmd)
+    return ans
 
 
 def _map_short_to_long_for_all_nix_commands():
     nix_commands_short_to_long = {}
     for cmd in NIX_COMMANDS:
-        help = subprocess.check_output([cmd, "--help"]).decode("utf-8")
-        parsed = _parse_short_to_long_from_help(help)
-        assert parsed, "Did not find any options for " + cmd
+        help = subprocess.check_output(
+            f"{cmd} --help".split(), env={"TERM": "dumb", "PATH": os.environ["PATH"]}
+        ).decode("utf-8")
+        help = re.sub(".\x08", "", help)
+        parsed = _parse_short_to_long_from_help(cmd, help)
         nix_commands_short_to_long[cmd] = parsed
     return nix_commands_short_to_long
 
 
-NIX_COMMANDS_SHORT_TO_LONG = _map_short_to_long_for_all_nix_commands()
+NIX_COMMANDS_SHORT_TO_LONG = {
+    k: v for k, v in _map_short_to_long_for_all_nix_commands().items() if v
+}
+NIX_COMMANDS_SHORT_TO_LONG["nix-info"] = {
+    "m": "--markdown"
+}  # nix-info --help is broken, so do it manually
+# Fix up missing args (that are not mentioned in --help, or not mentioned in the expected form)
+NIX_COMMANDS_SHORT_TO_LONG["nix build"]["L"] = "--print-build-logs"
+NIX_COMMANDS_SHORT_TO_LONG["nix-build"]["Q"] = "--no-build-output"
+NIX_COMMANDS_SHORT_TO_LONG["nix-build"]["E"] = "--expr"
+NIX_COMMANDS_SHORT_TO_LONG["nix-env"]["E"] = "--expr"
+NIX_COMMANDS_SHORT_TO_LONG["nix-shell"]["E"] = "--expr"
+NIX_COMMANDS_SHORT_TO_LONG["nix-instantiate"]["E"] = "--expr"
 # nix-collect-garbage has an unparsable manpage; TODO(alexander): submit PR
-NIX_COMMANDS_SHORT_TO_LONG["nix-collect-garbage"] = {"d": "delete-old"}
-
-
-def fixup_file(filename):
-    pass
+NIX_COMMANDS_SHORT_TO_LONG["nix-collect-garbage"] = {"d": "--delete-old"}
+NIX_COMMANDS_SHORT_TO_LONG["nix search"]["e"] = "--exclude"
+pprint.pprint(NIX_COMMANDS_SHORT_TO_LONG)
 
 
 def parse_args():
@@ -101,22 +155,10 @@ def _search(regexp):
     return re.compile(regexp).search
 
 
-def lt_escape(s):
-    return s.replace("<", "&lt;")
-
-
-def lt_unescape(s):
-    return s.replace("&lt;", "<")
-
-
 # just a heuristic hack
 SH_CMD_END = r' [|]{1,2} |; | && | [)]" |(?<!\\)(?:\\)*\n'
-# same as above, embedded in xml
-XML_SH_CMD_END = SH_CMD_END + "|<"
-EXT_TO_END_OF_STATEMENT_AND_TRANSFORM = [
-    (_search("\.(html|xml)$"), _search(XML_SH_CMD_END), lt_unescape, lt_escape),
-    (_search("."), _search(SH_CMD_END), id, id),
-]
+
+find_end = re.compile(SH_CMD_END).search
 
 
 def long_to_short(invocation_string):
@@ -131,10 +173,13 @@ def long_to_short(invocation_string):
     >>> long_to_short("nix-store --verify-path $(nix-store -qR $(which svn))")
     "nix-store --verify-path $(nix-store --query --requisites $(which svn))"
     """
-    nix_cmd = NIX_COMMAND_INVOCATION_REX.match(invocation_string).group(1)
-    nix_cmd_option_mapping = NIX_COMMANDS_SHORT_TO_LONG[nix_cmd]
+    if not (match := NIX_COMMAND_INVOCATION_REX.match(invocation_string)):
+        return invocation_string
+    nix_cmd = match.group(1)
+    if not (nix_cmd_option_mapping := NIX_COMMANDS_SHORT_TO_LONG.get(nix_cmd)):
+        return invocation_string
     known_shorts = "".join(nix_cmd_option_mapping)
-    regex = r"(?<= )-([%(known_shorts)s]+)" % dict(known_shorts=known_shorts)
+    regex = rf"(?<= )-([{known_shorts}]+)"
 
     def repl(m):
         ans = " ".join(nix_cmd_option_mapping[c] for c in m.group(1))
@@ -150,34 +195,33 @@ def long_to_short(invocation_string):
     return new
 
 
-def convert_file(filename):
-    log.info("Doing %s" % filename)
-    ext = os.path.splitext(filename)[-1] or ""
-    for (
-        test,
-        find_end,
-        in_transform,
-        out_transform,
-    ) in EXT_TO_END_OF_STATEMENT_AND_TRANSFORM:
-        if test(ext):
-            break
-    else:
-        assert False, "BUG, should have matched file-extension:" + ext
-    last = 0
+def longer_contents(contents):
     new_contents = []
-    with open(filename, "r") as fh:
-        contents = fh.read()
-    for match in NIX_COMMAND_INVOCATION_REX.finditer(contents):
+    last = 0
+    end = 0
+    while match := NIX_COMMAND_INVOCATION_REX.search(contents, end):
         start = match.start()
         end = find_end(contents, start).start()
         new_contents.append(contents[last:start])
-        new = out_transform(long_to_short(in_transform(contents[start:end])))
-        assert "&gt" not in new
+        new = long_to_short(contents[start:end])
         new_contents.append(new)
         last = end
     new_contents.append(contents[last:])
+    return "".join(new_contents)
+
+
+def convert_file(filename):
+    if os.path.islink(filename):
+        return
+    log.info("Doing %s" % filename)
+    ext = os.path.splitext(filename)[-1] or ""
+    last = 0
+    new_contents = []
+    open(filename, "r").read()
+    with open(filename, "r") as fh:
+        contents = fh.read()
     with open(filename, "w") as fh:
-        fh.write("".join(new_contents))
+        fh.write(longer_contents(contents))
 
 
 if __name__ == "__main__":
